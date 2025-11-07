@@ -12,9 +12,10 @@ import platform
 import mimetypes
 import traceback
 import hashlib
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional, Set, Union
+from typing import List, Dict, Any, Tuple, Optional, Set, Union, Callable
 
 from dotenv import load_dotenv
 import gradio as gr
@@ -30,6 +31,13 @@ try:
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
+
+try:
+    from llm_sandbox import SandboxSession
+    LLM_SANDBOX_AVAILABLE = True
+except ImportError:
+    SandboxSession = None
+    LLM_SANDBOX_AVAILABLE = False
 
 # ---------- Configuration ----------
 
@@ -369,6 +377,457 @@ def execute_file_creation(file_path: str, content: str, description: str, work_d
     except Exception as e:
         logger.error(f"Error creating file {file_path}: {e}", exc_info=True)
         return {"status": "error", "file_path": file_path, "message": str(e)}
+
+def get_llm_sandbox_tool_definition() -> Dict[str, Any]:
+    return {
+        "name": "execute_code",
+        "description": (
+            "Execute code inside the LLM Sandbox with optional library installation and timeout control. "
+            "Supports python, javascript, java, cpp, go, ruby, and r."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Code to execute inside the sandbox runtime"
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Programming language to use",
+                    "default": "python"
+                },
+                "libraries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional libraries/packages to install before execution"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Execution timeout in seconds (defaults to sandbox configuration)"
+                }
+            },
+            "required": ["code", "language"]
+        }
+    }
+
+def _normalize_sandbox_libraries(libraries: Optional[Union[List[str], str]]) -> Optional[List[str]]:
+    if libraries is None:
+        return None
+    if isinstance(libraries, list):
+        normalized = [str(lib).strip() for lib in libraries if str(lib).strip()]
+        return normalized or None
+    if isinstance(libraries, str):
+        stripped = libraries.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            normalized = [str(lib).strip() for lib in parsed if str(lib).strip()]
+            return normalized or None
+        return [stripped]
+    return None
+
+def execute_llm_sandbox_tool(
+    code: str,
+    language: str = "python",
+    libraries: Optional[Union[List[str], str]] = None,
+    timeout: Optional[Union[int, str]] = None
+) -> Dict[str, Any]:
+    if not LLM_SANDBOX_AVAILABLE:
+        return {
+            "status": "error",
+            "message": "llm-sandbox is not installed. Add it to requirements.txt and reinstall dependencies."
+        }
+
+    sanitized_code = (code or "").strip()
+    if not sanitized_code:
+        return {"status": "error", "message": "Code input is empty; nothing to execute."}
+
+    lang = (language or "python").strip() or "python"
+    normalized_libs = _normalize_sandbox_libraries(libraries)
+
+    exec_timeout: Optional[int] = None
+    if timeout is not None:
+        try:
+            exec_timeout = int(timeout)
+            if exec_timeout <= 0:
+                raise ValueError("Timeout must be positive")
+        except (TypeError, ValueError) as exc:
+            return {
+                "status": "error",
+                "message": f"Invalid timeout value: {timeout}",
+                "exception_type": type(exc).__name__
+            }
+
+    run_kwargs: Dict[str, Any] = {}
+    if normalized_libs:
+        run_kwargs["libraries"] = normalized_libs
+    if exec_timeout is not None:
+        run_kwargs["timeout"] = exec_timeout
+
+    start_ts = time.perf_counter()
+    try:
+        with SandboxSession(lang=lang) as session:
+            result = session.run(sanitized_code, **run_kwargs)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Sandbox execution failed: %s", exc, exc_info=True)
+        return {
+            "status": "error",
+            "message": str(exc),
+            "exception_type": type(exc).__name__,
+            "language": lang
+        }
+
+    duration = time.perf_counter() - start_ts
+    response: Dict[str, Any] = {
+        "status": "success",
+        "language": lang,
+        "duration_seconds": round(duration, 3),
+        "exit_code": getattr(result, "exit_code", None),
+        "stdout": getattr(result, "stdout", ""),
+        "stderr": getattr(result, "stderr", "")
+    }
+    if normalized_libs:
+        response["libraries"] = normalized_libs
+    if exec_timeout is not None:
+        response["timeout"] = exec_timeout
+
+    plots = []
+    for plot in getattr(result, "plots", []) or []:
+        plot_info = {
+            "filename": getattr(plot, "filename", None),
+            "mime_type": getattr(plot, "mime_type", None),
+            "content_base64": getattr(plot, "content_base64", None)
+        }
+        filtered = {k: v for k, v in plot_info.items() if v}
+        if filtered:
+            plots.append(filtered)
+    if plots:
+        response["plots"] = plots
+
+    return response
+
+# ---------- Sandbox Test Execution ----------
+
+def _has_python_tests(created_files: List[Dict[str, Any]], work_dir: Path) -> bool:
+    """Heuristic check to see if the LLM generated any pytest-style files."""
+    for entry in created_files or []:
+        if entry.get("status") != "success":
+            continue
+        file_path = Path(entry.get("file_path", ""))
+        if not file_path.exists() or file_path.suffix != ".py":
+            continue
+        try:
+            rel_path = file_path.relative_to(work_dir)
+        except ValueError:
+            rel_path = file_path
+        parts = {part.lower() for part in rel_path.parts}
+        if "tests" in parts or rel_path.name.startswith("test_"):
+            return True
+    return False
+
+def _assemble_repo_for_testing(original_codebase_dir: Optional[Path], work_dir: Path, created_files: List[Dict[str, Any]]) -> Optional[Path]:
+    """Create a temporary directory that merges the original codebase with generated files."""
+    staging_dir = Path(tempfile.mkdtemp(prefix="sandbox_repo_"))
+    try:
+        if original_codebase_dir and Path(original_codebase_dir).exists():
+            shutil.copytree(original_codebase_dir, staging_dir, dirs_exist_ok=True)
+        files_copied = False
+        for entry in created_files or []:
+            if entry.get("status") != "success":
+                continue
+            file_path = Path(entry.get("file_path", ""))
+            if not file_path.exists():
+                continue
+            try:
+                rel_path = file_path.relative_to(work_dir)
+            except ValueError:
+                rel_path = Path(file_path.name)
+            target_path = staging_dir / rel_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file_path, target_path)
+            files_copied = True
+        if not files_copied and not (original_codebase_dir and Path(original_codebase_dir).exists()):
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return None
+        return staging_dir
+    except Exception as exc:  # pylint: disable=broad-except
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        logger.error("Failed to assemble sandbox repo: %s", exc, exc_info=True)
+        return None
+
+def _build_install_steps(repo_root: Path) -> List[Dict[str, Any]]:
+    """Infer a lightweight installation sequence for the sandbox environment."""
+    steps: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, ...]] = set()
+
+    def add_step(cmd: List[str], label: str) -> None:
+        key = tuple(cmd)
+        if key in seen:
+            return
+        seen.add(key)
+        steps.append({"cmd": cmd, "label": label})
+
+    add_step(["python", "-m", "pip", "install", "--upgrade", "pip"], "Upgrade pip")
+    add_step(["python", "-m", "pip", "install", "pytest"], "Install pytest")
+
+    requirement_candidates = [
+        "requirements-test.txt",
+        "requirements_dev.txt",
+        "requirements-dev.txt",
+        "dev-requirements.txt",
+        "requirements.txt"
+    ]
+    for filename in requirement_candidates:
+        candidate = repo_root / filename
+        if candidate.exists():
+            rel = candidate.relative_to(repo_root).as_posix()
+            add_step(["python", "-m", "pip", "install", "-r", rel], f"Install {filename}")
+
+    # Search for additional requirement files nested in subdirectories
+    for req_path in sorted(repo_root.rglob("requirements*.txt")):
+        if not req_path.is_file():
+            continue
+        try:
+            rel = req_path.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        add_step(
+            ["python", "-m", "pip", "install", "-r", rel],
+            f"Install {rel}"
+        )
+
+    setup_roots: Set[Path] = set()
+    for marker in ("pyproject.toml", "setup.cfg", "setup.py"):
+        for path in repo_root.rglob(marker):
+            if not path.is_file():
+                continue
+            setup_roots.add(path.parent)
+
+    for package_dir in sorted(setup_roots):
+        try:
+            rel = package_dir.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        target = "." if rel == "." else rel
+        label = "Install project package" if target == "." else f"Install package {rel}"
+        add_step(["python", "-m", "pip", "install", target], label)
+
+    return steps
+
+def _bundle_repository(repo_root: Path) -> Tuple[Path, Path]:
+    """Zip the staged repository for transfer to the sandbox."""
+    bundle_dir = Path(tempfile.mkdtemp(prefix="sandbox_bundle_"))
+    archive_base = bundle_dir / "repo_bundle"
+    archive_path = Path(shutil.make_archive(str(archive_base), "zip", root_dir=repo_root))
+    return archive_path, bundle_dir
+
+def _run_repo_tests_in_sandbox(repo_root: Path, install_steps: List[Dict[str, Any]], log_destination: Path, timeout: int = 600) -> Dict[str, Any]:
+    """Copy the repo into the sandbox, install dependencies, run pytest, and collect logs."""
+    if not LLM_SANDBOX_AVAILABLE:
+        return {
+            "status": "error",
+            "message": "llm-sandbox is not installed.",
+            "exit_code": None,
+            "log_path": None
+        }
+
+    bundle_path, bundle_tmp_dir = _bundle_repository(repo_root)
+    remote_bundle = "/sandbox/project_bundle.zip"
+    remote_workspace = "/sandbox/project_workspace"
+    remote_log = "/sandbox/test_run.log"
+    test_command = ["python", "-m", "pytest", "-q"]
+
+    install_steps_literal = json.dumps(install_steps)
+    test_command_literal = json.dumps(test_command)
+    sandbox_code = textwrap.dedent(f"""
+        import json
+        import pathlib
+        import shutil
+        import subprocess
+        import sys
+        import zipfile
+
+        bundle_path = pathlib.Path("{remote_bundle}")
+        workspace = pathlib.Path("{remote_workspace}")
+        log_path = pathlib.Path("{remote_log}")
+
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        if not bundle_path.exists():
+            raise SystemExit("Bundle not found")
+        with zipfile.ZipFile(bundle_path, "r") as zf:
+            zf.extractall(workspace)
+
+        install_steps = json.loads({install_steps_literal!r})
+        test_command = json.loads({test_command_literal!r})
+
+        def append_lines(lines, target):
+            if not lines:
+                return
+            if not isinstance(lines, str):
+                lines = str(lines)
+            for raw in lines.splitlines():
+                line = raw.rstrip()
+                if not line:
+                    continue
+                print(line)
+                target.append(line)
+
+        log_lines = []
+        exit_code = 0
+
+        for step in install_steps:
+            cmd = []
+            label = ""
+            if isinstance(step, dict):
+                raw_cmd = step.get("cmd") or []
+                cmd = [str(part) for part in raw_cmd]
+                label = str(step.get("label") or "")
+            elif isinstance(step, (list, tuple)):
+                cmd = [str(part) for part in step]
+            elif isinstance(step, str):
+                cmd = step.split()
+                label = step
+            if not cmd:
+                continue
+            if not label:
+                label = " ".join(cmd) or "<sandbox step>"
+            append_lines(f"\\[sandbox\\] {{label}}", log_lines)
+            proc = subprocess.run(cmd, cwd=str(workspace), capture_output=True, text=True)
+            append_lines(proc.stdout, log_lines)
+            append_lines(proc.stderr, log_lines)
+            append_lines(f"\\[sandbox\\] exit={{proc.returncode}}", log_lines)
+            if proc.returncode != 0:
+                exit_code = proc.returncode
+                break
+
+        if exit_code == 0:
+            append_lines("[sandbox] running tests", log_lines)
+            proc = subprocess.run(test_command, cwd=str(workspace), capture_output=True, text=True)
+            append_lines(proc.stdout, log_lines)
+            append_lines(proc.stderr, log_lines)
+            exit_code = proc.returncode
+            append_lines(f"[sandbox] pytest exit={{exit_code}}", log_lines)
+
+        log_path.write_text("\\n".join(log_lines), encoding="utf-8")
+        print(f"SANDBOX_TEST_EXIT_CODE={{exit_code}}")
+        print(f"SANDBOX_TEST_LOG={{log_path}}")
+        sys.exit(exit_code)
+    """)
+
+    log_destination.parent.mkdir(parents=True, exist_ok=True)
+    run_result: Optional[Any] = None
+    try:
+        with SandboxSession(lang="python") as session:
+            session.copy_to_runtime(str(bundle_path), remote_bundle)
+            run_result = session.run(sandbox_code, timeout=timeout)
+            exit_code = getattr(run_result, "exit_code", None)
+            stdout = getattr(run_result, "stdout", "")
+            stderr = getattr(run_result, "stderr", "")
+            log_path = None
+            try:
+                session.copy_from_runtime(remote_log, str(log_destination))
+                log_path = str(log_destination)
+            except Exception as copy_exc:  # pylint: disable=broad-except
+                logger.error("Failed to copy sandbox log: %s", copy_exc, exc_info=True)
+                if stdout or stderr:
+                    fallback = "\n".join(filter(None, [stdout.strip(), stderr.strip()]))
+                    log_destination.write_text(fallback, encoding="utf-8")
+                    log_path = str(log_destination)
+
+            status = "success" if exit_code == 0 else "failed"
+            return {
+                "status": status,
+                "message": f"Pytest exit code {exit_code}",
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "log_path": log_path
+            }
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Sandbox test execution failed: %s", exc, exc_info=True)
+        if not log_destination.exists():
+            log_destination.write_text(f"Sandbox execution error: {exc}", encoding="utf-8")
+        return {
+            "status": "error",
+            "message": str(exc),
+            "exit_code": None,
+            "stdout": getattr(run_result, "stdout", "") if run_result else "",
+            "stderr": getattr(run_result, "stderr", "") if run_result else "",
+            "log_path": str(log_destination)
+        }
+    finally:
+        try:
+            bundle_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+        except TypeError:
+            if bundle_path.exists():
+                bundle_path.unlink()
+        shutil.rmtree(bundle_tmp_dir, ignore_errors=True)
+
+def maybe_run_tests_with_sandbox(
+    work_dir: Path,
+    original_codebase_dir: Optional[Path],
+    created_files: List[Dict[str, Any]],
+    log_progress: Optional[Callable[[str], None]] = None
+) -> Optional[Dict[str, Any]]:
+    """Entrypoint to execute pytest via llm-sandbox and return a created_files entry for the log."""
+    progress = log_progress or (lambda _: None)
+
+    if not LLM_SANDBOX_AVAILABLE:
+        progress("🧪 Skipping sandbox tests (llm-sandbox unavailable)")
+        return None
+    if not created_files:
+        progress("🧪 Skipping sandbox tests (no generated files)")
+        return None
+    if not _has_python_tests(created_files, work_dir):
+        progress("🧪 Skipping sandbox tests (no Python test files detected)")
+        return None
+
+    repo_root = _assemble_repo_for_testing(original_codebase_dir, work_dir, created_files)
+    if repo_root is None:
+        progress("🧪 Skipping sandbox tests (unable to stage repo)")
+        return None
+
+    install_steps = _build_install_steps(repo_root)
+    if not install_steps:
+        install_steps = [{"cmd": ["python", "-m", "pip", "install", "pytest"], "label": "Install pytest"}]
+
+    log_filename = f"sandbox_test_log_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.txt"
+    log_path = work_dir / log_filename
+
+    progress("🧪 Running pytest inside sandbox…")
+    try:
+        test_result = _run_repo_tests_in_sandbox(repo_root, install_steps, log_path)
+    finally:
+        shutil.rmtree(repo_root, ignore_errors=True)
+
+    if not log_path.exists():
+        progress("🧪 Sandbox tests failed (log missing)")
+        return None
+
+    exit_code = test_result.get("exit_code")
+    message = test_result.get("message") or "Sandbox pytest execution"
+    if exit_code not in (None, 0):
+        progress("🧪 Sandbox tests completed with failures ⚠️")
+        message = f"{message} (exit code {exit_code})"
+    else:
+        progress("🧪 Sandbox tests completed ✅")
+
+    return {
+        "status": "success",
+        "file_path": str(log_path),
+        "message": message,
+        "description": "LLM Sandbox pytest execution log",
+        "exit_code": exit_code
+    }
 
 # ---------- Repo-to-Text (single, de-duplicated implementation) ----------
 
@@ -1864,6 +2323,7 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
     - metadata: additional info for display
     """
     file_tool = get_file_creation_tool_definition()
+    sandbox_tool = get_llm_sandbox_tool_definition()
 
     def _extract_response_parts(resp):
         if not resp or not getattr(resp, "candidates", None):
@@ -1878,11 +2338,13 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
         thinking_config=types.ThinkingConfig(
             thinking_budget=-1,
         ),
-        tools=[types.Tool(function_declarations=[file_tool])],
+        tools=[types.Tool(function_declarations=[file_tool, sandbox_tool])],
         system_instruction=SYSTEM_PROMPT
     )
 
     created_files: List[Dict[str, Any]] = []
+    tool_responses: List[Dict[str, Any]] = []
+    tool_event_counter = 0
     thinking_buffer = ""
     thinking_message_id = "thinking"
 
@@ -1937,6 +2399,8 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                 if fc.name == "create_or_edit_file":
                     file_path = fc.args.get("file_path", "")
                     description = fc.args.get("description", "")
+                    tool_id = tool_event_counter
+                    tool_event_counter += 1
 
                     # Show tool call
                     yield {
@@ -1944,7 +2408,7 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                         "content": f"**File:** `{file_path}`\n**Purpose:** {description}",
                         "metadata": {
                             "title": f"🛠️ Creating: {file_path}",
-                            "id": f"tool_call_{len(created_files)}",
+                            "id": f"tool_call_{tool_id}",
                             "status": "pending"
                         }
                     }
@@ -1958,6 +2422,10 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                         original_codebase_files=original_codebase_files
                     )
                     created_files.append(result)
+                    tool_responses.append({
+                        "name": "create_or_edit_file",
+                        "response": result
+                    })
 
                     # Show tool result
                     if result.get("status") == "success":
@@ -1966,7 +2434,7 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                             "content": f"✅ {result.get('message', 'File created successfully')}",
                             "metadata": {
                                 "title": f"✅ Completed: {file_path}",
-                                "id": f"tool_result_{len(created_files)-1}",
+                                "id": f"tool_result_{tool_id}",
                                 "status": "done"
                             }
                         }
@@ -1976,10 +2444,87 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                             "content": f"❌ Error: {result.get('message', 'Unknown error')}",
                             "metadata": {
                                 "title": f"❌ Failed: {file_path}",
-                                "id": f"tool_result_{len(created_files)-1}",
+                                "id": f"tool_result_{tool_id}",
                                 "status": "done"
                             }
                         }
+                elif fc.name == "execute_code":
+                    code_snippet = fc.args.get("code", "")
+                    language = fc.args.get("language", "python")
+                    libraries = fc.args.get("libraries")
+                    timeout = fc.args.get("timeout")
+                    tool_id = tool_event_counter
+                    tool_event_counter += 1
+
+                    summary_lines = [f"**Language:** `{language}`"]
+                    if libraries:
+                        if isinstance(libraries, list):
+                            lib_str = ", ".join(str(lib) for lib in libraries)
+                        else:
+                            lib_str = str(libraries)
+                        summary_lines.append(f"**Libraries:** {lib_str}")
+                    if timeout is not None:
+                        summary_lines.append(f"**Timeout:** {timeout}s")
+                    preview = (code_snippet or "").strip()
+                    if preview:
+                        trimmed = preview if len(preview) <= 400 else preview[:400] + "…"
+                        summary_lines.append(f"```{language}\n{trimmed}\n```")
+
+                    yield {
+                        "type": "tool_call",
+                        "content": "\n".join(summary_lines),
+                        "metadata": {
+                            "title": "🛡️ LLM Sandbox execution",
+                            "id": f"tool_call_{tool_id}",
+                            "status": "pending"
+                        }
+                    }
+
+                    sandbox_result = execute_llm_sandbox_tool(
+                        code=code_snippet,
+                        language=language,
+                        libraries=libraries,
+                        timeout=timeout
+                    )
+                    tool_responses.append({
+                        "name": "execute_code",
+                        "response": sandbox_result
+                    })
+
+                    if sandbox_result.get("status") == "success":
+                        exit_code = sandbox_result.get("exit_code")
+                        stdout_preview = (sandbox_result.get("stdout") or "").strip()
+                        if stdout_preview and len(stdout_preview) > 500:
+                            stdout_preview = stdout_preview[:500] + "…"
+                        response_lines = [f"✅ Exit code: {exit_code}"]
+                        if stdout_preview:
+                            response_lines.append(f"```\n{stdout_preview}\n```")
+                        yield {
+                            "type": "tool_response",
+                            "content": "\n".join(response_lines),
+                            "metadata": {
+                                "title": "✅ Sandbox execution finished",
+                                "id": f"tool_result_{tool_id}",
+                                "status": "done"
+                            }
+                        }
+                    else:
+                        error_msg = sandbox_result.get("message", "Sandbox execution failed")
+                        stderr_text = sandbox_result.get("stderr") or ""
+                        if stderr_text:
+                            stderr_preview = stderr_text if len(stderr_text) <= 500 else stderr_text[:500] + "…"
+                            error_msg = f"{error_msg}\n```\n{stderr_preview}\n```"
+                        yield {
+                            "type": "tool_response",
+                            "content": f"❌ {error_msg}",
+                            "metadata": {
+                                "title": "❌ Sandbox execution failed",
+                                "id": f"tool_result_{tool_id}",
+                                "status": "done"
+                            }
+                        }
+                else:
+                    logger.warning(f"Received unsupported function call: {fc.name}")
 
     # Mark thinking as done if it was shown
     if thinking_buffer:
@@ -1993,15 +2538,18 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
             }
         }
 
+    base_text = accumulated_text
+    final_text = ""
+
     # If there were function calls, continue the conversation
-    if created_files:
+    if tool_responses:
         # Build tool response content
         tool_parts = [
             types.Part.from_function_response(
-                name="create_or_edit_file",
-                response=result
+                name=entry["name"],
+                response=entry["response"]
             )
-            for result in created_files
+            for entry in tool_responses
         ]
 
         # Add assistant's last content with explicit role
@@ -2023,7 +2571,6 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
             config=config
         )
 
-        base_text = accumulated_text
         final_text = ""
         for chunk in final_stream:
             _, _, parts = _extract_response_parts(chunk)
@@ -2037,7 +2584,7 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
                     }
 
     # Yield final result
-    combined_text = accumulated_text if not created_files else (base_text + final_text)
+    combined_text = accumulated_text if not tool_responses else (base_text + final_text)
     if not combined_text and last_candidate is not None:
         finish_info = getattr(last_candidate, "finish_reason", "")
         if finish_info:
@@ -2048,7 +2595,8 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
         "status": "success",
         "created_files": created_files,
         "summary": combined_text,
-        "total_files_created": sum(1 for f in created_files if f.get("status") == "success")
+        "total_files_created": sum(1 for f in created_files if f.get("status") == "success"),
+        "tool_responses": tool_responses
     }
 
 def infer(user_story: str, attached_files: List[Path], create_zip: bool, conversation_history: List[Dict[str, str]], session_state: Dict[str, Any]):
@@ -2135,7 +2683,7 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
             original_codebase_path = Path(original_codebase_path) if original_codebase_path else None
             original_codebase_files = set(session_state.get('original_codebase_files', []))
 
-        log_progress("🤖 Calling LLM (with create_file tool)…")
+        log_progress("🤖 Calling LLM (with agent tools)…")
         turn_start = time.time()
 
         contents = build_llm_request(sanitized_story, repo_contents, uploaded_refs, conversation_history)
@@ -2159,6 +2707,18 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
                 "summary": "No response received from the model",
                 "total_files_created": 0
             }
+
+        sandbox_log_entry = maybe_run_tests_with_sandbox(
+            work_dir=work_dir,
+            original_codebase_dir=original_codebase_path,
+            created_files=result.get("created_files", []),
+            log_progress=log_progress
+        )
+        if sandbox_log_entry:
+            result.setdefault("created_files", []).append(sandbox_log_entry)
+            result["total_files_created"] = sum(
+                1 for f in result.get("created_files", []) if f.get("status") == "success"
+            )
 
         log_progress("☁️ Uploading newly created files to Google Files…")
         new_refs = collect_and_upload_created_files(client, work_dir, since_ts=turn_start)
