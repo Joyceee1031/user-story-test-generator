@@ -50,6 +50,11 @@ INITIAL_ASSISTANT_MESSAGE = (
 
 SESSION_SELECTOR_DEFAULT = "Select a previous session..."
 
+PEPPERMINT_PRIMARY = "#3EB489"
+PEPPERMINT_DARK = "#0F3F31"
+PEPPERMINT_LIGHT = "#ECFFF7"
+PEPPERMINT_ACCENT = "#A2F5D5"
+
 SYSTEM_PROMPT = """\
 You are a senior QA engineer and software architect generating and improving automated test plans for a Python project.
 
@@ -311,6 +316,92 @@ def get_model_temperature() -> float:
 
 def get_model_name() -> str:
     return os.getenv("GEMINI_MODEL", DEFAULT_MODEL_NAME)
+
+
+def apply_peppermint_theme() -> None:
+    """Inject a peppermint-inspired visual theme into the Streamlit app."""
+    peppermint_css = f"""
+    <style>
+    :root {{
+        --peppermint-primary: {PEPPERMINT_PRIMARY};
+        --peppermint-dark: {PEPPERMINT_DARK};
+        --peppermint-light: {PEPPERMINT_LIGHT};
+        --peppermint-accent: {PEPPERMINT_ACCENT};
+        --peppermint-ink: #0A1F1A;
+    }}
+
+    .stApp {{
+        background: radial-gradient(circle at 20% 20%, rgba(62, 180, 137, 0.12), transparent 60%),
+                    radial-gradient(circle at 80% 0%, rgba(162, 245, 213, 0.35), transparent 55%),
+                    var(--peppermint-light);
+        color: var(--peppermint-ink);
+    }}
+
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {{
+        color: var(--peppermint-dark);
+    }}
+
+    section[data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, rgba(62, 180, 137, 0.15), rgba(236, 255, 247, 0.85));
+        border-right: 1px solid rgba(62, 180, 137, 0.25);
+    }}
+
+    .stButton>button,
+    div[data-testid="stDownloadButton"]>button {{
+        background-color: var(--peppermint-primary);
+        color: white;
+        border-radius: 20px;
+        border: 1px solid rgba(10, 31, 26, 0.1);
+        transition: transform 0.1s ease, box-shadow 0.2s ease;
+    }}
+
+    .stButton>button:hover,
+    div[data-testid="stDownloadButton"]>button:hover {{
+        transform: translateY(-1px);
+        box-shadow: 0 6px 18px rgba(62, 180, 137, 0.35);
+    }}
+
+    .stTabs [data-baseweb="tab"] {{
+        background-color: rgba(62, 180, 137, 0.08);
+        color: var(--peppermint-dark);
+    }}
+
+    .stTabs [data-baseweb="tab"]:hover {{
+        background-color: rgba(62, 180, 137, 0.15);
+    }}
+
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {{
+        background-color: white;
+        border-bottom: 3px solid var(--peppermint-primary);
+    }}
+
+    .stSelectbox>div>div>div,
+    .stTextInput>div>div>input,
+    .stTextArea>div>div>textarea,
+    .stFileUploader>div {{
+        border-radius: 14px;
+        border: 1px solid rgba(62, 180, 137, 0.35);
+        background-color: rgba(255, 255, 255, 0.9);
+    }}
+
+    .stSelectbox>div>div>div:focus-within,
+    .stTextInput>div>div>input:focus,
+    .stTextArea>div>div>textarea:focus {{
+        border: 1px solid var(--peppermint-primary);
+        box-shadow: 0 0 0 2px rgba(62, 180, 137, 0.25);
+    }}
+
+    [data-testid="stProgress"] div[role="progressbar"] {{
+        background-color: var(--peppermint-primary);
+    }}
+
+    .stAlert {{
+        border-left: 6px solid var(--peppermint-primary);
+        background-color: rgba(162, 245, 213, 0.25);
+    }}
+    </style>
+    """
+    st.markdown(peppermint_css, unsafe_allow_html=True)
 
 # ---------- Gemini Client ----------
 
@@ -3449,9 +3540,21 @@ def render_generator_page():
 
 
 def main():
-    st.set_page_config(page_title="User Story Test Generator", layout="wide")
-    st.title("User Story Test Generator")
-    st.caption("LLM-assisted workflow for turning user stories into runnable tests.")
+    st.set_page_config(
+        page_title="User Story Test Generator",
+        page_icon="Logo_nobg.png",
+        layout="wide"
+    )
+    apply_peppermint_theme()
+    title_logo_col, title_text_col = st.columns([1, 6])
+    with title_logo_col:
+        st.image("Logo_nobg.png", width=200)
+    with title_text_col:
+        st.markdown(
+            "<h1 style='margin-bottom: 0.25rem;'>User Story Test Generator</h1>",
+            unsafe_allow_html=True,
+        )
+        st.caption("LLM-assisted workflow for turning user stories into runnable tests.")
 
     # Initialize session state
     st.session_state.setdefault("session_id", datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))
