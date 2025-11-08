@@ -18,8 +18,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional, Set, Union, Callable
 
 from dotenv import load_dotenv
-import gradio as gr
-from gradio import ChatMessage
+import streamlit as st
 import yaml
 import pathspec
 from pathspec import PathSpec
@@ -238,7 +237,7 @@ After generating test files, provide a structured summary that includes:
 
 
 def normalize_uploaded_entry(entry: Any) -> Tuple[Optional[Path], Optional[str]]:
-    """Extract a filesystem path and display name from a Gradio upload payload."""
+    """Extract a filesystem path and display name from an upload payload."""
     candidate_path: Optional[Path] = None
     display_name: Optional[str] = None
 
@@ -1236,6 +1235,85 @@ def save_llm_context(user_story: str, repo_files: List[Tuple[str, str]], uploade
         "file_content_sample": {path: content[:500] for path, content in repo_files[:5]}
     }
     return save_json_file(context_data, "context_logs", "llm_context")
+
+
+def persist_session_artifacts(
+    session_id: str,
+    user_story_text: str,
+    attachments: List[Path],
+    zip_path: Optional[Path],
+    conversation_history: List[Dict[str, Any]],
+    tool_events: Optional[List[Dict[str, Any]]] = None,
+    session_metadata: Optional[Dict[str, Any]] = None,
+    conversion_updates: Optional[List[Dict[str, Any]]] = None,
+    summary: Optional[str] = None,
+    created_files: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Path]:
+    """
+    Persist per-session artifacts (inputs, conversation, tool calls, output bundle) locally.
+    """
+    try:
+        base_dir = ensure_dir(Path("session_logs"))
+        session_dir = ensure_dir(base_dir / session_id)
+        run_dir = ensure_dir(session_dir / datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f'))
+
+        uploads_dir: Optional[Path] = None
+        saved_uploads: List[Dict[str, Any]] = []
+        seen_sources: Set[str] = set()
+
+        for attachment in attachments or []:
+            if not attachment:
+                continue
+            candidate = Path(attachment)
+            source_key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+            if source_key in seen_sources or not candidate.exists():
+                continue
+            seen_sources.add(source_key)
+            uploads_dir = uploads_dir or ensure_dir(run_dir / "uploads")
+            target_path = uploads_dir / candidate.name
+            shutil.copy2(candidate, target_path)
+            saved_uploads.append({
+                "original_path": str(candidate),
+                "saved_path": str(target_path),
+                "size_bytes": target_path.stat().st_size
+            })
+
+        saved_zip_info: Optional[Dict[str, Any]] = None
+        if zip_path:
+            candidate_zip = Path(zip_path)
+            if candidate_zip.exists():
+                output_dir = ensure_dir(run_dir / "output")
+                target_zip = output_dir / candidate_zip.name
+                shutil.copy2(candidate_zip, target_zip)
+                saved_zip_info = {
+                    "original_path": str(candidate_zip),
+                    "saved_path": str(target_zip),
+                    "size_bytes": target_zip.stat().st_size
+                }
+
+        metadata: Dict[str, Any] = {
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "user_story_text": user_story_text,
+            "summary": summary,
+            "conversation_history": conversation_history,
+            "tool_events": tool_events or [],
+            "conversion_updates": conversion_updates or [],
+            "created_files": created_files or [],
+            "session_metadata": session_metadata or {},
+            "uploaded_files": saved_uploads,
+            "output_zip": saved_zip_info,
+            "run_directory": str(run_dir)
+        }
+
+        metadata_path = run_dir / "session.json"
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
+        logger.info("Saved session artifacts to %s", metadata_path)
+        return run_dir
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to persist session artifacts: %s", exc, exc_info=True)
+        return None
 
 def convert_markdown_to_pdf(md_file_path: Path, margin_top: str = "1in", margin_bottom: str = "1in", 
                             margin_left: str = "1in", margin_right: str = "1in") -> Optional[Path]:
@@ -2599,7 +2677,14 @@ def call_gemini_model(client: genai.Client, contents: List[Any], work_dir: Path,
         "tool_responses": tool_responses
     }
 
-def infer(user_story: str, attached_files: List[Path], create_zip: bool, conversation_history: List[Dict[str, str]], session_state: Dict[str, Any]):
+def infer(
+    user_story: str,
+    attached_files: List[Path],
+    create_zip: bool,
+    conversation_history: List[Dict[str, str]],
+    session_state: Dict[str, Any],
+    session_metadata: Optional[Dict[str, Any]] = None,
+):
     session_state = dict(session_state or {})
     session_id = session_state.get('session_id') or datetime.now().strftime('%Y%m%d_%H%M%S')
     logger.info(f"=== Processing request in session: {session_id} ===")
@@ -2787,6 +2872,23 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
             'assistant_summary': (summary[:500] if summary else f"Created {success_count} files")
         }]
 
+        # Persist session artifacts locally after ZIP creation
+        if zip_path:
+            saved_dir = persist_session_artifacts(
+                session_id=session_id,
+                user_story_text=sanitized_story,
+                attachments=attachment_paths,
+                zip_path=zip_path,
+                conversation_history=updated_history,
+                tool_events=result.get("tool_responses"),
+                session_metadata=session_metadata,
+                conversion_updates=conversion_updates,
+                summary=summary,
+                created_files=created_files,
+            )
+            if saved_dir:
+                log_progress(f"🗂️ Session artifacts saved to {saved_dir}")
+
         # Yield final result with summary, file list, and zip
         yield {
             "type": "final",
@@ -2809,231 +2911,215 @@ def infer(user_story: str, attached_files: List[Path], create_zip: bool, convers
             "session_state": session_state
         }
 
-# ---------- Chat Interface ----------
+# ---------- Form-based UI Helpers ----------
 
 
-def chat_handler(
-    message: Any,
-    history: List[Dict[str, Any]],
-    conversation_state_value: List[Dict[str, Any]],
-    session_state_value: Dict[str, Any]
-):
-    conv_state = list(conversation_state_value or [])
-    sess_state = dict(session_state_value or {})
-    create_zip_opt = True  # Always create ZIP
+def _compose_user_story_input(title: str, description: str) -> str:
+    sections = []
+    if title:
+        sections.append(f"User Story Title:\n{title.strip()}")
+    if description:
+        sections.append(f"User Story Description:\n{description.strip()}")
+    return "\n\n".join(sections).strip()
 
-    if isinstance(message, dict):
-        message_dict = message
-    else:
-        message_dict = {"text": str(message or ""), "files": []}
 
-    message_text = (message_dict.get("text") or "").strip()
-    file_infos: List[Tuple[Optional[Path], str]] = []
-    for entry in message_dict.get("files") or []:
-        path, display = normalize_uploaded_entry(entry)
-        if not path and not display:
+def _format_created_files(created_files: List[Dict[str, Any]]) -> str:
+    rows = []
+    for info in created_files or []:
+        if info.get("status") != "success":
             continue
-        label = display or (path.name if path else "(file)")
-        file_infos.append((path, label))
+        file_path = info.get("file_path")
+        if not file_path:
+            continue
+        name = Path(file_path).name
+        desc = info.get("description", "")
+        rows.append(f"- **{name}**{f': {desc}' if desc else ''}")
+    return "\n".join(rows)
 
-    if not message_text and not file_infos:
-        yield "⚠️ Please enter a message or attach files.", conv_state, sess_state
-        return
 
-    missing_files = [label for path, label in file_infos if path is None or not path.exists()]
-    if missing_files:
-        yield f"⚠️ Skipping missing file(s): {', '.join(missing_files)}", conv_state, sess_state
+def _persist_streamlit_upload(uploaded_file: Any) -> Optional[Path]:
+    """Save a Streamlit UploadedFile to disk for downstream processing."""
+    if uploaded_file is None:
+        return None
+    filename = Path(getattr(uploaded_file, "name", "upload.bin")).name or "upload.bin"
+    temp_dir = Path(tempfile.mkdtemp(prefix="streamlit_upload_"))
+    target_path = temp_dir / filename
+    buffer = uploaded_file.getbuffer()
+    target_path.write_bytes(buffer.tobytes() if hasattr(buffer, "tobytes") else bytes(buffer))
+    return target_path
 
-    attachments_to_process = [path for path, _ in file_infos if path and path.exists()]
-    if file_infos and sess_state.get("work_dir"):
-        warning = (
-            "⚠️ New file uploads are ignored after the first message. Clear the chat to start a fresh session if you "
-            "need to provide different files."
+
+def _prepare_zip_download(zip_path: Optional[str]) -> Optional[Tuple[str, bytes]]:
+    """Return (filename, bytes) for a generated ZIP so Streamlit can serve it."""
+    if not zip_path:
+        return None
+    candidate = Path(zip_path)
+    if not candidate.exists():
+        return None
+    return candidate.name, candidate.read_bytes()
+
+
+def render_generator_page():
+    st.subheader("Provide Your User Story")
+    with st.form("user-story-form"):
+        col_left, col_right = st.columns(2)
+        with col_left:
+            story_title = st.text_input("User Story Title", placeholder="e.g., Login Flow Happy Path")
+        with col_right:
+            uploaded_zip = st.file_uploader(
+                "Upload project ZIP or supporting artifacts",
+                type=[ext.lstrip(".") for ext in sorted(ALLOWED_EXTENSIONS)],
+                help="Uses Streamlit's documented st.file_uploader widget to collect optional context files.",
+            )
+        story_description = st.text_area(
+            "User Story Description",
+            placeholder="Explain what the feature does, acceptance criteria, and testing focus areas.",
+            height=200,
         )
-        yield warning, conv_state, sess_state
-        attachments_to_process = []
+        submitted = st.form_submit_button("Generate Test Cases", use_container_width=True)
 
-    sanitized_story = message_text
-    if not sanitized_story and attachments_to_process:
-        sanitized_story = "User uploaded new context files. Continue processing with these artifacts."
+    status_placeholder = st.empty()
+    summary_placeholder = st.empty()
+    download_placeholder = st.empty()
 
-    if not sanitized_story and not attachments_to_process:
-        yield "⚠️ Nothing to process yet. Provide instructions or new files.", conv_state, sess_state
+    if not submitted:
         return
+
+    story_text = _compose_user_story_input(story_title, story_description)
+    session_metadata: Dict[str, Any] = {
+        "user_story_title": story_title,
+        "user_story_description": story_description,
+        "form_story_text": story_text,
+        "submitted_at": datetime.now(timezone.utc).isoformat()
+    }
+    attachments: List[Path] = []
+    temp_paths: List[Path] = []
+    upload_records: List[Dict[str, Any]] = []
+
+    if uploaded_zip is not None:
+        persisted = _persist_streamlit_upload(uploaded_zip)
+        if persisted:
+            attachments.append(persisted)
+            temp_paths.append(persisted)
+            upload_records.append({
+                "original_name": getattr(uploaded_zip, "name", Path(persisted).name),
+                "temp_path": str(persisted),
+                "size_bytes": persisted.stat().st_size
+            })
+
+    session_metadata["uploaded_files"] = upload_records
+
+    if not story_text and not attachments:
+        summary_placeholder.warning("⚠️ Please enter a user story or upload a project ZIP before generating.")
+        return
+
+    status_lines = ["🚀 Generating test cases..."]
+    status_placeholder.info("\n\n".join(status_lines))
+    summary_placeholder.info("Preparing artifacts…")
+    download_placeholder.empty()
+
+    conversation_history: List[Dict[str, str]] = st.session_state.get("conversation_history", [])
+    agent_session_state: Dict[str, Any] = st.session_state.get("agent_session_state", {})
 
     try:
-        inference = infer(sanitized_story, attachments_to_process, bool(create_zip_opt), conv_state, sess_state)
-        current_conv = conv_state
-        current_session = sess_state
-
-        # Accumulate ALL messages in a list
-        all_messages = []
-        streaming_summary_index = None  # Track which message is the streaming summary
-
-        for update in inference:
+        for update in infer(
+            story_text,
+            attachments,
+            True,
+            conversation_history,
+            agent_session_state,
+            session_metadata=session_metadata,
+        ):
             update_type = update.get("type")
-            current_session = update.get("session_state", current_session)
-            current_conv = update.get("conversation_history", current_conv)
 
-            if update_type == "thought":
-                # Add model's thinking as collapsible
+            if update_type in {"thought", "tool_call", "tool_response"}:
                 content = update.get("content", "")
-                metadata = update.get("metadata", {})
-                thought_msg = ChatMessage(
-                    role="assistant",
-                    content=content,
-                    metadata=metadata
-                )
-                all_messages.append(thought_msg)
-                # Yield the accumulated list so far
-                yield all_messages, current_conv, current_session
-
-            elif update_type == "tool_call":
-                # Add tool call as collapsible
-                content = update.get("content", "")
-                metadata = update.get("metadata", {})
-                tool_msg = ChatMessage(
-                    role="assistant",
-                    content=content,
-                    metadata=metadata
-                )
-                all_messages.append(tool_msg)
-                # Yield the accumulated list so far
-                yield all_messages, current_conv, current_session
-
-            elif update_type == "tool_response":
-                # Add tool result
-                content = update.get("content", "")
-                metadata = update.get("metadata", {})
-                result_msg = ChatMessage(
-                    role="assistant",
-                    content=content,
-                    metadata=metadata
-                )
-                all_messages.append(result_msg)
-                # Yield the accumulated list so far
-                yield all_messages, current_conv, current_session
+                if content:
+                    status_lines.append(content)
+                status_placeholder.info("\n\n".join(status_lines))
 
             elif update_type == "text":
-                # Stream the summary text
                 content = update.get("content", "")
-
-                if streaming_summary_index is None:
-                    # First chunk - create new message
-                    summary_msg = ChatMessage(
-                        role="assistant",
-                        content=content
-                    )
-                    all_messages.append(summary_msg)
-                    streaming_summary_index = len(all_messages) - 1
-                else:
-                    # Update existing message with new content
-                    all_messages[streaming_summary_index] = ChatMessage(
-                        role="assistant",
-                        content=content
-                    )
-
-                # Yield the accumulated list with streaming summary
-                yield all_messages, current_conv, current_session
+                summary_placeholder.markdown(content or "Processing…")
 
             elif update_type == "final":
-                # Add summary only if it wasn't already streamed
-                summary = update.get("message", "")
-                if summary and streaming_summary_index is None:
-                    # Summary wasn't streamed, add it now
-                    all_messages.append(ChatMessage(
-                        role="assistant",
-                        content=summary
-                    ))
-                elif summary and streaming_summary_index is not None:
-                    # Summary was streamed, just ensure final content is correct
-                    all_messages[streaming_summary_index] = ChatMessage(
-                        role="assistant",
-                        content=summary
+                summary = update.get("message") or update.get("summary") or ""
+                files_section = _format_created_files(update.get("created_files", []))
+                if files_section:
+                    summary = (summary + "\n\n### Generated Files\n" + files_section).strip()
+                zip_payload = _prepare_zip_download(update.get("zip_path"))
+
+                status_lines.append("✅ Generation complete")
+                status_placeholder.success("\n\n".join(status_lines))
+
+                final_summary = summary or "Generation complete. Download the bundle for details."
+                summary_placeholder.markdown(f"#### Summary of Test Case Result\n\n{final_summary}")
+
+                download_placeholder.empty()
+                if zip_payload:
+                    file_name, file_bytes = zip_payload
+                    download_placeholder.download_button(
+                        "Download Generated ZIP",
+                        data=file_bytes,
+                        file_name=file_name,
+                        mime="application/zip",
+                        use_container_width=True,
                     )
+                else:
+                    download_placeholder.info("No downloadable bundle was produced for this run.")
 
-                # Add created files list as separate message
-                created_files = update.get("created_files", [])
-                total_files = update.get("total_files_created", 0)
-                if created_files:
-                    files_list = []
-                    files_list.append(f"### 📁 Generated Files ({total_files})")
-                    files_list.append("")
-                    for file_info in created_files:
-                        if file_info.get("status") == "success":
-                            path = file_info.get("file_path", "")
-                            desc = file_info.get("description", "")
-                            files_list.append(f"✅ **{path}**")
-                            if desc:
-                                files_list.append(f"   *{desc}*")
-                            files_list.append("")
-
-                    all_messages.append(ChatMessage(
-                        role="assistant",
-                        content="\n".join(files_list)
-                    ))
-
-                # Add ZIP file attachment
-                bundle_path = update.get("zip_path")
-                if bundle_path:
-                    bundle = Path(bundle_path)
-                    if bundle.exists():
-                        all_messages.append(ChatMessage(
-                            role="assistant",
-                            content=gr.File(
-                                value=str(bundle),
-                                label="📦 Download Generated Bundle"
-                            )
-                        ))
-
-                # Yield final accumulated list
-                yield all_messages, current_conv, current_session
+                st.session_state["conversation_history"] = update.get("conversation_history", conversation_history)
+                st.session_state["agent_session_state"] = update.get("session_state", agent_session_state)
                 return
-
-            sess_state = current_session
-            conv_state = current_conv
-
-        # If loop completes without final message
-        all_messages.append(ChatMessage(
-            role="assistant",
-            content="❌ Inference interrupted unexpectedly."
-        ))
-        yield all_messages, current_conv, current_session
-
-    except Exception as exc:
-        logger.error("chat_handler failed: %s", exc, exc_info=True)
-        all_messages.append(ChatMessage(
-            role="assistant",
-            content=f"❌ Error: {exc}"
-        ))
-        yield all_messages, conv_state, sess_state
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Streamlit handler encountered an error: %s", exc, exc_info=True)
+        summary_placeholder.error(f"❌ Error: {exc}")
+    finally:
+        for temp_path in temp_paths:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception as cleanup_err:  # pylint: disable=broad-except
+                logger.warning("Failed to remove temp upload %s: %s", temp_path, cleanup_err)
 
 
-with gr.Blocks(css="footer {visibility: hidden}") as demo:
-    conversation_state = gr.State([])
-    session_state = gr.State({})
+def render_dashboard_page():
+    st.subheader("Dashboard Overview")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(label="Total User Stories", value="12")
+    with col2:
+        st.metric(label="Total Test Cases Generated", value="68")
 
-    gr.ChatInterface(
-        fn=chat_handler,
-        type="messages",
-        multimodal=True,
-        save_history=True,
-        chatbot=gr.Chatbot(
-            label="Test Generator",
-            height=600,
-            type="messages",
-            placeholder=INITIAL_ASSISTANT_MESSAGE  # Show as placeholder instead of initial message
-        ),
-        textbox=gr.MultimodalTextbox(
-            placeholder="Describe your test requirements or attach files (ZIP, PDF, images)…",
-            file_count="multiple",
-            sources=["upload"],
-            file_types=["file"]
-        ),
-        additional_inputs=[conversation_state, session_state],
-        additional_outputs=[conversation_state, session_state],
-        cache_examples=False
+    st.markdown("### Recent User Story History")
+    st.table(
+        {
+            "User Story Title": ["Login App v2", "Checkout Flow", "Reporting Suite", "Inventory Sync", "Onboarding Wizard"],
+            "Created Date": ["2025-11-08", "2025-11-07", "2025-11-07", "2025-11-06", "2025-11-05"],
+            "Test Cases": [8, 10, 6, 9, 7],
+        }
     )
 
+
+def main():
+    st.set_page_config(page_title="User Story Test Generator", layout="wide")
+    st.title("User Story Test Generator")
+    st.caption("LLM-assisted workflow for turning user stories into runnable tests.")
+
+    st.session_state.setdefault("conversation_history", [])
+    st.session_state.setdefault("agent_session_state", {})
+
+    nav_choice = st.sidebar.radio("Navigation", ["Test Case Generator", "Dashboard"])
+    if nav_choice == "Dashboard":
+        render_dashboard_page()
+    else:
+        render_generator_page()
+
+
 if __name__ == "__main__":
-    demo.launch()
+    try:
+        main()
+    except RuntimeError as runtime_error:
+        print(
+            f"Runtime error: {runtime_error}. "
+            "If you're running this with `python app.py`, try `streamlit run app.py` instead."
+        )

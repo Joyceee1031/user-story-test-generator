@@ -1,5 +1,5 @@
 google-genai
-gradio
+streamlit
 pathspec
 PyYAML
 python-dotenv
