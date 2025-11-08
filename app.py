@@ -48,6 +48,8 @@ INITIAL_ASSISTANT_MESSAGE = (
     "then describe what tests you need. I'll generate test specifications and code for you."
 )
 
+SESSION_SELECTOR_DEFAULT = "Select a previous session..."
+
 SYSTEM_PROMPT = """\
 You are a senior QA engineer and software architect generating and improving automated test plans for a Python project.
 
@@ -2959,31 +2961,352 @@ def _prepare_zip_download(zip_path: Optional[str]) -> Optional[Tuple[str, bytes]
     return candidate.name, candidate.read_bytes()
 
 
+def _get_all_previous_sessions() -> List[Tuple[str, str, str]]:
+    """
+    Scan session_logs directory and return list of (session_id, run_timestamp, display_name).
+    Returns sessions sorted by timestamp (newest first).
+    """
+    sessions_list: List[Tuple[str, str, str]] = []
+    session_logs_dir = Path("session_logs")
+    
+    if not session_logs_dir.exists():
+        return sessions_list
+    
+    try:
+        for session_folder in sorted(session_logs_dir.iterdir(), reverse=True):
+            if not session_folder.is_dir():
+                continue
+            session_id = session_folder.name
+            
+            # Find run directories (subdirectories with session.json)
+            for run_folder in sorted(session_folder.iterdir(), reverse=True):
+                if not run_folder.is_dir():
+                    continue
+                session_json_path = run_folder / "session.json"
+                if session_json_path.exists():
+                    run_timestamp = run_folder.name
+                    
+                    # Try to extract title from session.json
+                    title = "Untitled"
+                    try:
+                        session_data = json.loads(session_json_path.read_text(encoding='utf-8'))
+                        title = session_data.get("session_metadata", {}).get("user_story_title", "Untitled")
+                        if not title or not title.strip():
+                            title = "Untitled"
+                    except Exception:
+                        pass
+                    
+                    display_name = f"{title} ({session_id})"
+                    sessions_list.append((session_id, run_timestamp, display_name))
+    except Exception as e:
+        logger.warning(f"Error scanning session_logs: {e}")
+    
+    return sessions_list
+
+
+def _load_session_data(session_id: str, run_timestamp: str) -> Optional[Dict[str, Any]]:
+    """Load session.json data for a given session and run timestamp."""
+    session_json_path = Path("session_logs") / session_id / run_timestamp / "session.json"
+    
+    if not session_json_path.exists():
+        logger.warning(f"Session file not found: {session_json_path}")
+        return None
+    
+    try:
+        data = json.loads(session_json_path.read_text(encoding='utf-8'))
+        return data
+    except Exception as e:
+        logger.error(f"Error loading session data: {e}")
+        return None
+
+
+def _restore_session_to_state(session_data: Dict[str, Any]) -> None:
+    """Restore a loaded session into Streamlit session state for display."""
+    st.session_state["session_id"] = session_data.get("session_id", "")
+    st.session_state["current_story_title"] = session_data.get("session_metadata", {}).get("user_story_title", "")
+    st.session_state["current_story_description"] = session_data.get("session_metadata", {}).get("user_story_description", "")
+    st.session_state["form_submitted"] = True
+    st.session_state["reviewed_session_data"] = session_data
+    st.session_state["viewing_previous_session"] = True
+    st.session_state["session_stopped"] = False
+    st.session_state["suppress_session_autoload"] = False
+    logger.info(f"Restored session: {session_data.get('session_id')}")
+
+
+def _initialize_session():
+    """Initialize or reset session state with a new session ID."""
+    session_id = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+    st.session_state["session_id"] = session_id
+    st.session_state.pop("session_selector", None)  # Reset any previous session selection
+    st.session_state["reset_session_selector"] = True
+    st.session_state["conversation_history"] = []
+    st.session_state["agent_session_state"] = {}
+    st.session_state["current_story_title"] = ""
+    st.session_state["current_story_description"] = ""
+    st.session_state["current_uploaded_file"] = None
+    st.session_state["form_submitted"] = False
+    st.session_state["viewing_previous_session"] = False
+    st.session_state["reviewed_session_data"] = None
+    st.session_state["last_loaded_session_display"] = None  # Reset the loaded session tracker
+    st.session_state["session_stopped"] = False
+    st.session_state["suppress_session_autoload"] = True
+    logger.info(f"New session initialized: {session_id}")
+    return session_id
+
+
+def _stop_session():
+    """Mark the current session as stopped and clear transient state."""
+    session_id = st.session_state.get("session_id")
+    st.session_state["session_stopped"] = True
+    st.session_state["form_submitted"] = False
+    st.session_state["viewing_previous_session"] = False
+    st.session_state["reviewed_session_data"] = None
+    st.session_state["last_loaded_session_display"] = None
+    st.session_state["conversation_history"] = []
+    st.session_state["agent_session_state"] = {}
+    st.session_state["current_story_title"] = ""
+    st.session_state["current_story_description"] = ""
+    st.session_state["current_uploaded_file"] = None
+    st.session_state.pop("session_selector", None)
+    st.session_state["reset_session_selector"] = True
+    st.session_state["suppress_session_autoload"] = True
+    logger.info(f"Session stopped: {session_id}")
+
+
 def render_generator_page():
-    st.subheader("Provide Your User Story")
-    with st.form("user-story-form"):
-        col_left, col_right = st.columns(2)
-        with col_left:
-            story_title = st.text_input("User Story Title", placeholder="e.g., Login Flow Happy Path")
-        with col_right:
-            uploaded_zip = st.file_uploader(
-                "Upload project ZIP or supporting artifacts",
-                type=[ext.lstrip(".") for ext in sorted(ALLOWED_EXTENSIONS)],
-                help="Uses Streamlit's documented st.file_uploader widget to collect optional context files.",
+    # Auto-initialize session on first page load
+    if "session_id" not in st.session_state:
+        _initialize_session()
+    
+    suppress_session_autoload = st.session_state.pop("suppress_session_autoload", False)
+    
+    # Check if form has been submitted
+    form_submitted = st.session_state.get("form_submitted", False)
+    viewing_previous = st.session_state.get("viewing_previous_session", False)
+    
+    # Session management header with selector
+    col1, col2, col3 = st.columns([2, 1, 1])
+
+    with col1:
+        st.subheader("Provide Your User Story")
+    
+    with col2:
+        # Load previous sessions for selector
+        previous_sessions = _get_all_previous_sessions()
+        if previous_sessions:
+            if st.session_state.pop("reset_session_selector", False):
+                st.session_state["session_selector"] = SESSION_SELECTOR_DEFAULT
+            # Determine default index: 0 for new sessions, or find current session index if viewing previous
+            default_index = 0
+            # Only show the selected session if we're actively viewing a previous session
+            if st.session_state.get("viewing_previous_session") and st.session_state.get("last_loaded_session_display"):
+                current_display = st.session_state["last_loaded_session_display"]
+                for idx, (_, _, display) in enumerate(previous_sessions):
+                    if display == current_display:
+                        default_index = idx + 1  # +1 because of "Select..." option
+                        break
+            
+            session_options = [SESSION_SELECTOR_DEFAULT] + [display for _, _, display in previous_sessions]
+            selected_session = st.selectbox(
+                "Load Previous Session",
+                session_options,
+                index=default_index,
+                label_visibility="collapsed",
+                key="session_selector"
             )
-        story_description = st.text_area(
-            "User Story Description",
-            placeholder="Explain what the feature does, acceptance criteria, and testing focus areas.",
-            height=200,
-        )
-        submitted = st.form_submit_button("Generate Test Cases", use_container_width=True)
+            
+            # Only process selection if:
+            # 1. It's not the default "Select..." option
+            # 2. It's different from the last loaded session
+            # 3. We're not currently viewing a previous session (prevents re-triggering on rerun)
+            last_loaded_session = st.session_state.get("last_loaded_session_display")
+            is_viewing_previous = st.session_state.get("viewing_previous_session", False)
+            
+            # Only load if user actively selected a new session (not already viewing it)
+            if (selected_session != SESSION_SELECTOR_DEFAULT and 
+                selected_session != last_loaded_session and
+                not is_viewing_previous and
+                not suppress_session_autoload):
+                # Find the corresponding session_id and run_timestamp
+                for sess_id, run_ts, display in previous_sessions:
+                    if display == selected_session:
+                        session_data = _load_session_data(sess_id, run_ts)
+                        if session_data:
+                            st.session_state["last_loaded_session_display"] = selected_session
+                            _restore_session_to_state(session_data)
+                            st.rerun()
+                        break
+            
+            if suppress_session_autoload:
+                # Allow future manual loads after the initial rerun
+                st.session_state["suppress_session_autoload"] = False
+    
+    with col3:
+        if st.button("🔄 New Session", use_container_width=True, help="Clear current session and start fresh"):
+            _initialize_session()
+            st.rerun()
+        if st.button("⏹ Stop Session", use_container_width=True, help="Stop the current session and discard progress"):
+            _stop_session()
+            st.rerun()
+
+    if st.session_state.get("session_stopped"):
+        st.info("This session has been stopped. Start a new session to continue.")
+        return
+    
+    # If viewing a previous session, display it the same way as current session
+    if viewing_previous and st.session_state.get("reviewed_session_data"):
+        session_data = st.session_state["reviewed_session_data"]
+        session_meta = session_data.get("session_metadata", {})
+        
+        # Don't show the form, skip directly to results display
+        st.divider()
+        st.subheader("📋 User Story Summary")
+        
+        summary_col1, summary_col2 = st.columns([2, 1])
+        with summary_col1:
+            st.markdown("**Title:**")
+            st.write(session_meta.get("user_story_title", "N/A"))
+            st.markdown("**Description:**")
+            st.write(session_meta.get("user_story_description", "N/A"))
+        
+        with summary_col2:
+            st.markdown("**Uploaded Files:**")
+            uploaded_files = session_meta.get("uploaded_files", [])
+            if uploaded_files:
+                for uf in uploaded_files:
+                    st.success(f"✓ {uf.get('original_name', 'File')}")
+            else:
+                st.info("No files uploaded")
+        
+        st.divider()
+        
+        status_placeholder = st.empty()
+        summary_placeholder = st.empty()
+        download_placeholder = st.empty()
+        
+        # Build status lines from tool events and conversion updates
+        status_lines = ["✅ Generation complete (Previous Session)"]
+        
+        tool_events = session_data.get("tool_events", [])
+        if tool_events:
+            for event in tool_events:
+                event_type = event.get("type", "")
+                content = event.get("content", "")
+                if content:
+                    if event_type == "tool_call":
+                        status_lines.append(f"🔧 {content}")
+                    elif event_type == "tool_response":
+                        status_lines.append(f"✓ {content}")
+                    elif event_type == "thought":
+                        status_lines.append(f"💭 {content}")
+        
+        conversion_updates = session_data.get("conversion_updates", [])
+        if conversion_updates:
+            for update in conversion_updates:
+                msg = update.get("message", "")
+                if msg:
+                    status_lines.append(msg)
+        
+        status_placeholder.success("\n\n".join(status_lines))
+        
+        # Display summary and created files
+        summary = session_data.get("summary", "")
+        created_files = session_data.get("created_files", [])
+        
+        # Format summary with created files list
+        final_summary = summary or "Generation complete. See files below."
+        if created_files:
+            files_section = _format_created_files(created_files)
+            if files_section:
+                final_summary = (final_summary + "\n\n### Generated Files\n" + files_section).strip()
+        
+        summary_placeholder.markdown(f"#### Summary of Test Case Result\n\n{final_summary}")
+        
+        # Download generated ZIP
+        output_zip = session_data.get("output_zip", {})
+        if output_zip and output_zip.get("saved_path"):
+            zip_path = output_zip.get("saved_path")
+            zip_payload = _prepare_zip_download(zip_path)
+            
+            if zip_payload:
+                file_name, file_bytes = zip_payload
+                download_placeholder.download_button(
+                    "Download Generated ZIP",
+                    data=file_bytes,
+                    file_name=file_name,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                download_placeholder.info("⚠️ Previous session ZIP is no longer available for download.")
+        else:
+            download_placeholder.info("ℹ️ No output ZIP was generated for this session.")
+        
+        return
+    
+    # Show form only if not submitted
+    if not form_submitted:
+        with st.form("user-story-form", clear_on_submit=True):
+            col_left, col_right = st.columns(2)
+            with col_left:
+                story_title = st.text_input(
+                    "User Story Title",
+                    placeholder="e.g., Login Flow Happy Path",
+                    value=st.session_state.get("current_story_title", "")
+                )
+            with col_right:
+                uploaded_zip = st.file_uploader(
+                    "Upload project ZIP or supporting artifacts",
+                    type=[ext.lstrip(".") for ext in sorted(ALLOWED_EXTENSIONS)],
+                    help="Uses Streamlit's documented st.file_uploader widget to collect optional context files.",
+                )
+            story_description = st.text_area(
+                "User Story Description",
+                placeholder="Explain what the feature does, acceptance criteria, and testing focus areas.",
+                height=200,
+                value=st.session_state.get("current_story_description", "")
+            )
+            submitted = st.form_submit_button("Generate Test Cases", use_container_width=True)
+
+        if submitted:
+            # Save form inputs to session state for persistence
+            st.session_state["current_story_title"] = story_title
+            st.session_state["current_story_description"] = story_description
+            st.session_state["current_uploaded_file"] = uploaded_zip
+            st.session_state["form_submitted"] = True
+            st.rerun()
+        else:
+            return
+    
+    # Display summary when form is submitted
+    st.divider()
+    st.subheader("📋 User Story Summary")
+    
+    summary_col1, summary_col2 = st.columns([2, 1])
+    with summary_col1:
+        st.markdown("**Title:**")
+        st.write(st.session_state.get("current_story_title", "N/A"))
+        st.markdown("**Description:**")
+        st.write(st.session_state.get("current_story_description", "N/A"))
+    
+    with summary_col2:
+        st.markdown("**Uploaded Files:**")
+        uploaded_file_name = st.session_state.get("current_uploaded_file")
+        if uploaded_file_name:
+            st.success(f"✓ {getattr(uploaded_file_name, 'name', 'File uploaded')}")
+        else:
+            st.info("No files uploaded")
+    
+    st.divider()
 
     status_placeholder = st.empty()
     summary_placeholder = st.empty()
     download_placeholder = st.empty()
 
-    if not submitted:
-        return
+    # Get saved values from session state
+    story_title = st.session_state.get("current_story_title", "")
+    story_description = st.session_state.get("current_story_description", "")
+    uploaded_zip = st.session_state.get("current_uploaded_file")
 
     story_text = _compose_user_story_input(story_title, story_description)
     session_metadata: Dict[str, Any] = {
@@ -3082,37 +3405,24 @@ def render_generator_page():
                 logger.warning("Failed to remove temp upload %s: %s", temp_path, cleanup_err)
 
 
-def render_dashboard_page():
-    st.subheader("Dashboard Overview")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(label="Total User Stories", value="12")
-    with col2:
-        st.metric(label="Total Test Cases Generated", value="68")
-
-    st.markdown("### Recent User Story History")
-    st.table(
-        {
-            "User Story Title": ["Login App v2", "Checkout Flow", "Reporting Suite", "Inventory Sync", "Onboarding Wizard"],
-            "Created Date": ["2025-11-08", "2025-11-07", "2025-11-07", "2025-11-06", "2025-11-05"],
-            "Test Cases": [8, 10, 6, 9, 7],
-        }
-    )
-
-
 def main():
     st.set_page_config(page_title="User Story Test Generator", layout="wide")
     st.title("User Story Test Generator")
     st.caption("LLM-assisted workflow for turning user stories into runnable tests.")
 
+    # Initialize session state
+    st.session_state.setdefault("session_id", datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))
     st.session_state.setdefault("conversation_history", [])
     st.session_state.setdefault("agent_session_state", {})
+    st.session_state.setdefault("current_story_title", "")
+    st.session_state.setdefault("current_story_description", "")
+    st.session_state.setdefault("current_uploaded_file", None)
+    st.session_state.setdefault("form_submitted", False)
+    st.session_state.setdefault("viewing_previous_session", False)
+    st.session_state.setdefault("reviewed_session_data", None)
+    st.session_state.setdefault("session_stopped", False)
 
-    nav_choice = st.sidebar.radio("Navigation", ["Test Case Generator", "Dashboard"])
-    if nav_choice == "Dashboard":
-        render_dashboard_page()
-    else:
-        render_generator_page()
+    render_generator_page()
 
 
 if __name__ == "__main__":
