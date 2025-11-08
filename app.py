@@ -331,9 +331,7 @@ def apply_peppermint_theme() -> None:
     }}
 
     .stApp {{
-        background: radial-gradient(circle at 20% 20%, rgba(62, 180, 137, 0.12), transparent 60%),
-                    radial-gradient(circle at 80% 0%, rgba(162, 245, 213, 0.35), transparent 55%),
-                    var(--peppermint-light);
+        background: linear-gradient(180deg, rgba(236, 255, 247, 0.98) 0%, rgba(62, 180, 137, 0.35) 60%, rgba(15, 63, 49, 0.15) 100%);
         color: var(--peppermint-ink);
     }}
 
@@ -3548,13 +3546,18 @@ def main():
     apply_peppermint_theme()
     title_logo_col, title_text_col = st.columns([1, 6])
     with title_logo_col:
-        st.image("Logo_nobg.png", width=200)
+        st.image("Logo_nobg_notext.png", width=110)
     with title_text_col:
         st.markdown(
-            "<h1 style='margin-bottom: 0.25rem;'>User Story Test Generator</h1>",
+            "<h1 style='margin-bottom: 0.25rem; margin-left: -3rem;'>User Story Test Generator</h1>",
             unsafe_allow_html=True,
         )
-        st.caption("LLM-assisted workflow for turning user stories into runnable tests.")
+        st.markdown(
+            "<p style='margin-left: -2.8rem; margin-top: 0; color: rgba(15, 63, 49, 0.85);'>"
+            "LLM-assisted workflow for turning user stories into runnable tests."
+            "</p>",
+            unsafe_allow_html=True,
+        )
 
     # Initialize session state
     st.session_state.setdefault("session_id", datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S'))
