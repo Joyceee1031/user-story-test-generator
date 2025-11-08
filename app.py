@@ -3030,6 +3030,8 @@ def _restore_session_to_state(session_data: Dict[str, Any]) -> None:
     st.session_state["viewing_previous_session"] = True
     st.session_state["session_stopped"] = False
     st.session_state["suppress_session_autoload"] = False
+    st.session_state["generation_complete"] = False
+    st.session_state["last_generation_snapshot"] = None
     logger.info(f"Restored session: {session_data.get('session_id')}")
 
 
@@ -3050,6 +3052,8 @@ def _initialize_session():
     st.session_state["last_loaded_session_display"] = None  # Reset the loaded session tracker
     st.session_state["session_stopped"] = False
     st.session_state["suppress_session_autoload"] = True
+    st.session_state["generation_complete"] = False
+    st.session_state["last_generation_snapshot"] = None
     logger.info(f"New session initialized: {session_id}")
     return session_id
 
@@ -3070,6 +3074,8 @@ def _stop_session():
     st.session_state.pop("session_selector", None)
     st.session_state["reset_session_selector"] = True
     st.session_state["suppress_session_autoload"] = True
+    st.session_state["generation_complete"] = False
+    st.session_state["last_generation_snapshot"] = None
     logger.info(f"Session stopped: {session_id}")
 
 
@@ -3088,7 +3094,10 @@ def render_generator_page():
     col1, col2, col3 = st.columns([2, 1, 1])
 
     with col1:
-        st.subheader("Provide Your User Story")
+        if viewing_previous:
+            st.subheader("Historical Session")
+        else:
+            st.subheader("Provide Your User Story")
     
     with col2:
         # Load previous sessions for selector
@@ -3118,14 +3127,12 @@ def render_generator_page():
             # Only process selection if:
             # 1. It's not the default "Select..." option
             # 2. It's different from the last loaded session
-            # 3. We're not currently viewing a previous session (prevents re-triggering on rerun)
+            # 3. Autoload suppression flag is not set (prevents unintended loads after reset)
             last_loaded_session = st.session_state.get("last_loaded_session_display")
-            is_viewing_previous = st.session_state.get("viewing_previous_session", False)
             
             # Only load if user actively selected a new session (not already viewing it)
             if (selected_session != SESSION_SELECTOR_DEFAULT and 
                 selected_session != last_loaded_session and
-                not is_viewing_previous and
                 not suppress_session_autoload):
                 # Find the corresponding session_id and run_timestamp
                 for sess_id, run_ts, display in previous_sessions:
@@ -3274,6 +3281,8 @@ def render_generator_page():
             st.session_state["current_story_description"] = story_description
             st.session_state["current_uploaded_file"] = uploaded_zip
             st.session_state["form_submitted"] = True
+            st.session_state["generation_complete"] = False
+            st.session_state["last_generation_snapshot"] = None
             st.rerun()
         else:
             return
@@ -3302,6 +3311,32 @@ def render_generator_page():
     status_placeholder = st.empty()
     summary_placeholder = st.empty()
     download_placeholder = st.empty()
+
+    snapshot = st.session_state.get("last_generation_snapshot")
+    if st.session_state.get("generation_complete") and snapshot:
+        status_lines = snapshot.get("status_lines", [])
+        if status_lines:
+            status_placeholder.success("\n\n".join(status_lines))
+        summary_markdown = snapshot.get("summary_markdown", "#### Summary of Test Case Result\n\nGeneration complete.")
+        summary_placeholder.markdown(summary_markdown)
+        download_placeholder.empty()
+        zip_path = snapshot.get("zip_path")
+        if zip_path:
+            zip_payload = _prepare_zip_download(zip_path)
+            if zip_payload:
+                file_name, file_bytes = zip_payload
+                download_placeholder.download_button(
+                    "Download Generated ZIP",
+                    data=file_bytes,
+                    file_name=file_name,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                download_placeholder.info("No downloadable bundle was produced for this run.")
+        else:
+            download_placeholder.info("No downloadable bundle was produced for this run.")
+        return
 
     # Get saved values from session state
     story_title = st.session_state.get("current_story_title", "")
@@ -3376,9 +3411,11 @@ def render_generator_page():
                 status_placeholder.success("\n\n".join(status_lines))
 
                 final_summary = summary or "Generation complete. Download the bundle for details."
-                summary_placeholder.markdown(f"#### Summary of Test Case Result\n\n{final_summary}")
+                summary_markdown = f"#### Summary of Test Case Result\n\n{final_summary}"
+                summary_placeholder.markdown(summary_markdown)
 
                 download_placeholder.empty()
+                zip_path = update.get("zip_path")
                 if zip_payload:
                     file_name, file_bytes = zip_payload
                     download_placeholder.download_button(
@@ -3393,6 +3430,12 @@ def render_generator_page():
 
                 st.session_state["conversation_history"] = update.get("conversation_history", conversation_history)
                 st.session_state["agent_session_state"] = update.get("session_state", agent_session_state)
+                st.session_state["generation_complete"] = True
+                st.session_state["last_generation_snapshot"] = {
+                    "status_lines": list(status_lines),
+                    "summary_markdown": summary_markdown,
+                    "zip_path": zip_path,
+                }
                 return
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Streamlit handler encountered an error: %s", exc, exc_info=True)
@@ -3420,6 +3463,8 @@ def main():
     st.session_state.setdefault("form_submitted", False)
     st.session_state.setdefault("viewing_previous_session", False)
     st.session_state.setdefault("reviewed_session_data", None)
+    st.session_state.setdefault("generation_complete", False)
+    st.session_state.setdefault("last_generation_snapshot", None)
     st.session_state.setdefault("session_stopped", False)
 
     render_generator_page()
